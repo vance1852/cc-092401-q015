@@ -133,6 +133,36 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            if method == "POST" and path == "/exports":
+                result = self.service.create_export(
+                    self._actor(normalized_headers),
+                    payload["batch_ids"],
+                    payload["output_dir"],
+                    records_per_shard=int(payload.get("records_per_shard", 1000)),
+                )
+                return Response(201, result)
+            if method == "POST" and path == "/exports/claim":
+                result = self.service.claim_export(
+                    payload["worker_id"], int(payload.get("lease_seconds", 60))
+                )
+                return Response(200, {"job": result})
+            if method == "POST" and len(parts) == 3 and parts[0] == "exports" and parts[2] == "advance":
+                max_shards = payload.get("max_shards")
+                result = self.service.advance_export(
+                    payload["worker_id"], parts[1],
+                    max_shards=None if max_shards is None else int(max_shards),
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "exports" and parts[2] == "fail":
+                result = self.service.fail_export(
+                    payload["worker_id"], parts[1], payload["error"],
+                    int(payload.get("retry_seconds", 0)),
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "exports" and parts[2] == "verify":
+                return Response(200, self.service.verify_export(parts[1]))
+            if method == "GET" and len(parts) == 2 and parts[0] == "exports":
+                return Response(200, self.service.get_export(self._actor(normalized_headers), parts[1]))
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})

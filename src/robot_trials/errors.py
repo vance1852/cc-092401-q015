@@ -29,3 +29,10 @@ class InvalidState(ServiceError):
 class ValidationFailed(ServiceError):
     code = "validation_failed"
     status = 422
+
+
+class ExportIntegrityError(ServiceError):
+    """导出分片或清单复核失败，任务不能完成。"""
+
+    code = "export_integrity_failure"
+    status = 409

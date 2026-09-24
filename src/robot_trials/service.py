@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Iterable, Mapping
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
 
+from . import exports
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
 from .contracts import Observation, Protocol, ValidationError
-from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
+from .errors import Conflict, ExportIntegrityError, Forbidden, InvalidState, NotFound, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 ROLE_PERMISSIONS = {
@@ -23,7 +30,7 @@ ROLE_PERMISSIONS = {
     },
     "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
     "approver": {"decision.write"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "export.create", "export.read"},
 }
 
 
@@ -557,4 +564,649 @@ class TrialService:
             "decision": None if decision_row is None else dict(decision_row),
             "exclusions": [dict(row) for row in exclusions],
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
+        }
+
+    # ------------------------------------------------------------------
+    # 持久化证据包导出
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _export_request(batch_ids: Sequence[str], records_per_shard: int) -> dict[str, Any]:
+        return {"batch_ids": list(batch_ids), "records_per_shard": records_per_shard}
+
+    def create_export(
+        self,
+        actor_id: str,
+        batch_ids: Sequence[str],
+        output_dir: str | Path,
+        *,
+        records_per_shard: int = 1000,
+    ) -> dict[str, Any]:
+        """提交批次集合：立即冻结各批次引用上界并返回（可能已有的）导出任务。"""
+
+        self._require(actor_id, "export.create")
+        if not batch_ids:
+            raise ValidationFailed("导出批次集合不能为空")
+        ordered = [str(item).strip() for item in batch_ids]
+        if any(not item for item in ordered):
+            raise ValidationFailed("批次编号不能为空")
+        if len(set(ordered)) != len(ordered):
+            raise ValidationFailed("导出批次集合不能重复")
+        if isinstance(records_per_shard, bool) or not isinstance(records_per_shard, int):
+            raise ValidationFailed("records_per_shard 必须是整数")
+        if not 1 <= records_per_shard <= 100_000:
+            raise ValidationFailed("records_per_shard 必须在 1 到 100000 之间")
+        target_dir = str(Path(output_dir))
+        request = self._export_request(ordered, records_per_shard) | {"output_dir": target_dir}
+        request_digest = content_digest([request])
+        task_id = f"exp-{request_digest}"
+
+        # 查重、冻结上界读取与计划写入放在同一个立即事务中，保证冻结快照一致；
+        # 并发提交同一请求时由 request_sha256 唯一约束兜底。
+        try:
+            with transaction(self.connection, immediate=True):
+                existing = self.connection.execute(
+                    "SELECT task_id FROM export_tasks WHERE request_sha256=?", (request_digest,)
+                ).fetchone()
+                if existing is not None:
+                    replayed = existing["task_id"]
+                else:
+                    replayed = None
+                if replayed is None:
+                    now = self._now()
+                    frozen: list[dict[str, Any]] = []
+                    for ordinal, batch_id in enumerate(ordered):
+                        batch = self.get_batch(batch_id)
+                        protocol_row = self.connection.execute(
+                            "SELECT content_sha256 FROM protocol_catalog WHERE protocol_id=? AND version=?",
+                            (batch["protocol_id"], batch["protocol_version"]),
+                        ).fetchone()
+                        if protocol_row is None:
+                            raise NotFound("批次引用的协议版本不存在")
+                        analysis_row = self.connection.execute(
+                            "SELECT * FROM analyses WHERE batch_id=? ORDER BY analysis_id DESC LIMIT 1",
+                            (batch_id,),
+                        ).fetchone()
+                        decision_row = None
+                        if analysis_row is not None:
+                            decision_row = self.connection.execute(
+                                "SELECT * FROM decisions WHERE analysis_id=?", (analysis_row["analysis_id"],)
+                            ).fetchone()
+                        observation_high, observation_count = self.connection.execute(
+                            "SELECT COALESCE(MAX(observation_id),0),COUNT(*) FROM observations WHERE batch_id=?",
+                            (batch_id,),
+                        ).fetchone()
+                        event_high, event_count = self.connection.execute(
+                            "SELECT COALESCE(MAX(event_id),0),COUNT(*) FROM audit_events "
+                            "WHERE entity_type='batch' AND entity_id=?",
+                            (batch_id,),
+                        ).fetchone()
+                        frozen.append({
+                            "ordinal": ordinal,
+                            "batch_id": batch_id,
+                            "batch_revision": batch["revision"],
+                            "protocol_id": batch["protocol_id"],
+                            "protocol_version": batch["protocol_version"],
+                            "protocol_sha256": protocol_row["content_sha256"],
+                            "analysis_id": None if analysis_row is None else analysis_row["analysis_id"],
+                            "analysis_sha256": None if analysis_row is None
+                            else content_digest([json.loads(analysis_row["result_json"])]),
+                            "decision_id": None if decision_row is None else decision_row["decision_id"],
+                            "decision_sha256": None if decision_row is None
+                            else content_digest([dict(decision_row)]),
+                            "observation_high_id": int(observation_high),
+                            "observation_count": int(observation_count),
+                            "event_high_id": int(event_high),
+                            "event_count": int(event_count),
+                            "frozen_at": now,
+                        })
+
+                    def type_count(item: dict[str, Any]) -> dict[str, int]:
+                        return {
+                            "protocol": 1,
+                            "analysis": 0 if item["analysis_id"] is None else 1,
+                            "decision": 0 if item["decision_id"] is None else 1,
+                            "observation": item["observation_count"],
+                            "event": item["event_count"],
+                        }
+
+                    batch_type_counts = [type_count(item) for item in frozen]
+                    total_records = sum(sum(counts.values()) for counts in batch_type_counts)
+                    boundaries = exports.plan_shards(total_records, records_per_shard)
+                    request_json = canonical_json(request)
+                    self.connection.execute(
+                        "INSERT INTO export_tasks(task_id,state,request_sha256,request_json,output_dir,shard_count,"
+                        "records_per_shard,available_at,created_by,created_at,updated_at) "
+                        "VALUES(?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (task_id, request_digest, request_json, target_dir, len(boundaries),
+                         records_per_shard, now, actor_id, now, now),
+                    )
+                    for item in frozen:
+                        self.connection.execute(
+                            "INSERT INTO export_batches(task_id,ordinal,batch_id,batch_revision,protocol_id,"
+                            "protocol_version,protocol_sha256,analysis_id,analysis_sha256,decision_id,"
+                            "decision_sha256,observation_high_id,event_high_id,observation_count,event_count,frozen_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                task_id, item["ordinal"], item["batch_id"], item["batch_revision"], item["protocol_id"],
+                                item["protocol_version"], item["protocol_sha256"], item["analysis_id"],
+                                item["analysis_sha256"], item["decision_id"], item["decision_sha256"],
+                                item["observation_high_id"], item["event_high_id"], item["observation_count"],
+                                item["event_count"], item["frozen_at"],
+                            ),
+                        )
+                    for shard_index, (start, end) in enumerate(boundaries):
+                        expected = {name: 0 for name in exports.RECORD_TYPES}
+                        cursor = 0
+                        for counts in batch_type_counts:
+                            batch_total = sum(counts.values())
+                            overlap_start = max(0, start - cursor)
+                            overlap_end = min(batch_total, end - cursor)
+                            if overlap_end > overlap_start:
+                                # 批次内记录按固定类型顺序排列，定位重叠区间覆盖的类型。
+                                within = 0
+                                for name in exports.RECORD_TYPES:
+                                    type_start = within
+                                    type_end = within + counts[name]
+                                    covered = max(0, min(type_end, overlap_end) - max(type_start, overlap_start))
+                                    expected[name] += covered
+                                    within = type_end
+                            cursor += batch_total
+                        self.connection.execute(
+                            "INSERT INTO export_shards(task_id,shard_index,ordinal_start,ordinal_end,state,"
+                            "record_types_json,updated_at) VALUES(?,?,?,?, 'planned', ?,?)",
+                            (task_id, shard_index, start, end, canonical_json(expected), now),
+                        )
+                    self._audit("export_task", task_id, "export.created", actor_id, {
+                        "batch_count": len(ordered),
+                        "record_count": total_records,
+                        "shard_count": len(boundaries),
+                    })
+        except sqlite3.IntegrityError:
+            # 并发提交了同一请求：重放必须返回同一任务而不是重复产物。
+            row = self.connection.execute(
+                "SELECT task_id FROM export_tasks WHERE request_sha256=?", (request_digest,)
+            ).fetchone()
+            replayed = row["task_id"]
+        if replayed is not None:
+            return self.get_export(actor_id, replayed) | {"replayed": True}
+        return self.get_export(actor_id, task_id) | {"replayed": False}
+
+    def claim_export(self, worker_id: str, lease_seconds: int = 60) -> dict[str, Any] | None:
+        """领取排队中的导出任务，或接管租约到期的任务。"""
+
+        if lease_seconds <= 0:
+            raise ValidationFailed("租约时长必须大于零")
+        now = self._now()
+        expires = isoformat(self.clock.now() + timedelta(seconds=lease_seconds))
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT task_id FROM export_tasks WHERE "
+                "(state='queued' AND available_at<=?) OR (state='leased' AND lease_expires_at<=?) "
+                "ORDER BY available_at,created_at LIMIT 1",
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            self.connection.execute(
+                "UPDATE export_tasks SET state='leased',attempts=attempts+1,lease_owner=?,lease_expires_at=?,"
+                "updated_at=? WHERE task_id=?",
+                (worker_id, expires, now, row["task_id"]),
+            )
+            claimed = self.connection.execute(
+                "SELECT * FROM export_tasks WHERE task_id=?", (row["task_id"],)
+            ).fetchone()
+        return dict(claimed)
+
+    def _lease_export(self, task_id: str, worker_id: str) -> sqlite3.Row:
+        task = self.connection.execute(
+            "SELECT * FROM export_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise NotFound("导出任务不存在")
+        if task["state"] != "leased" or task["lease_owner"] != worker_id:
+            raise InvalidState("导出任务未由当前工作进程持有")
+        if task["lease_expires_at"] <= self._now():
+            raise InvalidState("导出任务租约已经过期")
+        return task
+
+    def _frozen_batches(self, task_id: str) -> list[sqlite3.Row]:
+        return list(self.connection.execute(
+            "SELECT * FROM export_batches WHERE task_id=? ORDER BY ordinal", (task_id,)
+        ).fetchall())
+
+    def _batch_records(self, item: sqlite3.Row) -> list[dict[str, Any]]:
+        """按固定类型顺序构造单个批次冻结范围内的全部记录。"""
+
+        records: list[dict[str, Any]] = []
+        protocol_row = self.connection.execute(
+            "SELECT canonical_json,content_sha256 FROM protocol_catalog "
+            "WHERE protocol_id=? AND version=?",
+            (item["protocol_id"], item["protocol_version"]),
+        ).fetchone()
+        if protocol_row is None or protocol_row["content_sha256"] != item["protocol_sha256"]:
+            raise ExportIntegrityError(
+                f"批次 {item['batch_id']} 冻结的协议版本缺失或被改写"
+            )
+        records.append({
+            "batch_id": item["batch_id"],
+            "record_type": "protocol",
+            "record": {
+                "batch_id": item["batch_id"],
+                "protocol_id": item["protocol_id"],
+                "version": item["protocol_version"],
+                "content_sha256": item["protocol_sha256"],
+                "document": json.loads(protocol_row["canonical_json"]),
+            },
+        })
+        if item["analysis_id"] is not None:
+            analysis_row = self.connection.execute(
+                "SELECT * FROM analyses WHERE analysis_id=?", (item["analysis_id"],)
+            ).fetchone()
+            if analysis_row is None:
+                raise ExportIntegrityError(f"冻结的分析 {item['analysis_id']} 已不存在")
+            records.append({
+                "batch_id": item["batch_id"],
+                "record_type": "analysis",
+                "record": {
+                    "batch_id": item["batch_id"],
+                    "analysis_id": analysis_row["analysis_id"],
+                    "batch_revision": analysis_row["batch_revision"],
+                    "protocol_sha256": analysis_row["protocol_sha256"],
+                    "input_sha256": analysis_row["input_sha256"],
+                    "algorithm_version": analysis_row["algorithm_version"],
+                    "seed": analysis_row["seed"],
+                    "result": json.loads(analysis_row["result_json"]),
+                },
+            })
+        if item["decision_id"] is not None:
+            decision_row = self.connection.execute(
+                "SELECT * FROM decisions WHERE decision_id=?", (item["decision_id"],)
+            ).fetchone()
+            if decision_row is None:
+                raise ExportIntegrityError(f"冻结的决定 {item['decision_id']} 已不存在")
+            records.append({
+                "batch_id": item["batch_id"],
+                "record_type": "decision",
+                "record": {
+                    "batch_id": item["batch_id"],
+                    "decision_id": decision_row["decision_id"],
+                    "analysis_id": decision_row["analysis_id"],
+                    "decision": decision_row["decision"],
+                    "reason": decision_row["reason"],
+                    "decided_by": decision_row["decided_by"],
+                    "decided_at": decision_row["decided_at"],
+                },
+            })
+        observation_rows = self.connection.execute(
+            "SELECT o.*,e.reason AS excluded_reason FROM observations o "
+            "LEFT JOIN exclusion_requests e ON e.observation_id=o.observation_id AND e.status='approved' "
+            "WHERE o.batch_id=? AND o.observation_id<=? ORDER BY o.observation_id",
+            (item["batch_id"], item["observation_high_id"]),
+        ).fetchall()
+        for row in observation_rows:
+            records.append({
+                "batch_id": item["batch_id"],
+                "record_type": "observation",
+                "record": {
+                    "batch_id": item["batch_id"],
+                    "observation_id": row["observation_id"],
+                    "source_batch": row["source_batch"],
+                    "source_row": row["source_row"],
+                    "robot_id": row["robot_id"],
+                    "stratum_key": row["stratum_key"],
+                    "observed_at": row["observed_at"],
+                    "metrics": json.loads(row["metrics_json"]),
+                    "content_sha256": row["content_sha256"],
+                    "excluded_reason": row["excluded_reason"],
+                },
+            })
+        event_rows = self.connection.execute(
+            "SELECT event_id,event_type,actor_id,payload_json,created_at FROM audit_events "
+            "WHERE entity_type='batch' AND entity_id=? AND event_id<=? ORDER BY event_id",
+            (item["batch_id"], item["event_high_id"]),
+        ).fetchall()
+        for row in event_rows:
+            records.append({
+                "batch_id": item["batch_id"],
+                "record_type": "event",
+                "record": {
+                    "batch_id": item["batch_id"],
+                    "event_id": row["event_id"],
+                    "event_type": row["event_type"],
+                    "actor_id": row["actor_id"],
+                    "payload": json.loads(row["payload_json"]),
+                    "created_at": row["created_at"],
+                },
+            })
+        return records
+
+    def _records_for_range(
+        self, frozen_rows: Sequence[sqlite3.Row], ordinal_start: int, ordinal_end: int
+    ) -> list[dict[str, Any]]:
+        """取出全局序号区间 [start,end) 内的记录并补编全局序号。"""
+
+        envelopes: list[dict[str, Any]] = []
+        cursor = 0
+        for item in frozen_rows:
+            batch_total = (
+                1
+                + (0 if item["analysis_id"] is None else 1)
+                + (0 if item["decision_id"] is None else 1)
+                + item["observation_count"]
+                + item["event_count"]
+            )
+            if cursor + batch_total > ordinal_start and cursor < ordinal_end:
+                batch_records = self._batch_records(item)
+                if len(batch_records) != batch_total:
+                    raise ExportIntegrityError(
+                        f"批次 {item['batch_id']} 冻结记录数与实际不符"
+                    )
+                low = max(0, ordinal_start - cursor)
+                high = min(batch_total, ordinal_end - cursor)
+                for record in batch_records[low:high]:
+                    envelopes.append(record)
+            cursor += batch_total
+        if len(envelopes) != ordinal_end - ordinal_start:
+            raise ExportIntegrityError("导出记录区间与分片计划不一致")
+        for offset, record in enumerate(envelopes):
+            record["ordinal"] = ordinal_start + offset
+        return envelopes
+
+    def _fail_export_permanently(self, task_id: str, error: str) -> None:
+        self.connection.execute(
+            "UPDATE export_tasks SET state='failed',lease_owner=NULL,lease_expires_at=NULL,"
+            "last_error=?,updated_at=?,finished_at=? WHERE task_id=?",
+            (error[:1000], self._now(), self._now(), task_id),
+        )
+
+    def advance_export(
+        self, worker_id: str, task_id: str, *, max_shards: int | None = None
+    ) -> dict[str, Any]:
+        """从最后已确认分片继续生成；全部确认并复核通过后才完成任务。"""
+
+        task = self._lease_export(task_id, worker_id)
+        shard_rows = self.connection.execute(
+            "SELECT * FROM export_shards WHERE task_id=? ORDER BY shard_index", (task_id,)
+        ).fetchall()
+        frozen_rows = self._frozen_batches(task_id)
+        output_dir = task["output_dir"]
+        processed = 0
+        for shard in shard_rows:
+            if shard["state"] == "confirmed":
+                continue
+            if self._now() >= task["lease_expires_at"]:
+                break
+            if max_shards is not None and processed >= max_shards:
+                break
+            start, end = shard["ordinal_start"], shard["ordinal_end"]
+            try:
+                envelopes = self._records_for_range(frozen_rows, start, end)
+                payload = exports.encode_records(envelopes)
+                target = exports.shard_path(output_dir, task_id, shard["shard_index"])
+                # 未确认分片可能来自崩溃的前次尝试，直接覆盖重写。
+                exports.atomic_write(target, payload)
+                summary = exports.inspect_shard_file(target, start, end)
+                expected_types = json.loads(shard["record_types_json"])
+                if summary["record_types"] != expected_types:
+                    raise ExportIntegrityError(
+                        f"分片 {shard['shard_index']} 记录类型分布与冻结计划不一致"
+                    )
+            except ExportIntegrityError:
+                with transaction(self.connection, immediate=True):
+                    self._fail_export_permanently(task_id, f"分片 {shard['shard_index']} 复核失败")
+                    self._audit("export_task", task_id, "export.failed", worker_id, {
+                        "shard_index": shard["shard_index"],
+                    })
+                raise
+            now = self._now()
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "UPDATE export_shards SET state='confirmed',record_count=?,record_types_json=?,"
+                    "first_record_key=?,last_record_key=?,content_sha256=?,updated_at=? "
+                    "WHERE task_id=? AND shard_index=? AND state='planned'",
+                    (
+                        summary["record_count"], canonical_json(summary["record_types"]),
+                        summary["first_record_key"], summary["last_record_key"],
+                        summary["content_sha256"], now, task_id, shard["shard_index"],
+                    ),
+                )
+                self.connection.execute(
+                    "UPDATE export_tasks SET updated_at=? WHERE task_id=?", (now, task_id)
+                )
+            processed += 1
+
+        refreshed = self.connection.execute(
+            "SELECT * FROM export_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        pending = self.connection.execute(
+            "SELECT COUNT(*) FROM export_shards WHERE task_id=? AND state='planned'", (task_id,)
+        ).fetchone()[0]
+        if pending:
+            return {
+                "task_id": task_id,
+                "state": refreshed["state"],
+                "processed": processed,
+                "shards_pending": pending,
+                "lease_active": self._now() < refreshed["lease_expires_at"],
+            }
+        try:
+            return self._finalize_export(task_id, worker_id)
+        except ExportIntegrityError as exc:
+            # 全量复核（含已确认分片）发现篡改或缺损：任务失败，不会产出清单。
+            with transaction(self.connection, immediate=True):
+                self._fail_export_permanently(task_id, str(exc))
+                self._audit("export_task", task_id, "export.failed", worker_id, {"stage": "finalize"})
+            raise
+
+    def _finalize_export(self, task_id: str, worker_id: str) -> dict[str, Any]:
+        """重新复核全部分片，构建清单并完成任务。"""
+
+        task = self.connection.execute("SELECT * FROM export_tasks WHERE task_id=?", (task_id,)).fetchone()
+        frozen_rows = self._frozen_batches(task_id)
+        shard_rows = self.connection.execute(
+            "SELECT * FROM export_shards WHERE task_id=? ORDER BY shard_index", (task_id,)
+        ).fetchall()
+        if len(shard_rows) != task["shard_count"]:
+            raise ExportIntegrityError("分片数量与任务计划不一致")
+        shard_summaries: list[dict[str, Any]] = []
+        for shard in shard_rows:
+            target = exports.shard_path(task["output_dir"], task_id, shard["shard_index"])
+            try:
+                summary = exports.inspect_shard_file(target, shard["ordinal_start"], shard["ordinal_end"])
+            except ExportIntegrityError as exc:
+                raise ExportIntegrityError(f"分片 {shard['shard_index']} 复核失败: {exc}") from exc
+            if shard["state"] != "confirmed" or summary["content_sha256"] != shard["content_sha256"]:
+                raise ExportIntegrityError(
+                    f"分片 {shard['shard_index']} 已确认内容被改动，拒绝完成导出"
+                )
+            if summary["record_count"] != shard["record_count"]:
+                raise ExportIntegrityError(f"分片 {shard['shard_index']} 记录数与确认摘要不一致")
+            shard_summaries.append({
+                "index": shard["shard_index"],
+                "file": target.name,
+                "ordinal_start": shard["ordinal_start"],
+                "ordinal_end": shard["ordinal_end"],
+                "record_count": summary["record_count"],
+                "record_types": summary["record_types"],
+                "first_record_key": summary["first_record_key"],
+                "last_record_key": summary["last_record_key"],
+                "content_sha256": summary["content_sha256"],
+            })
+        total_records = sum(item["record_count"] for item in shard_summaries)
+        manifest_entries = [dict(row) for row in frozen_rows]
+        for entry in manifest_entries:
+            entry.pop("task_id", None)
+        manifest = exports.build_manifest(
+            task_id=task_id,
+            request_sha256=task["request_sha256"],
+            records_per_shard=task["records_per_shard"],
+            total_records=total_records,
+            batches=manifest_entries,
+            shard_summaries=shard_summaries,
+            created_at=self._now(),
+        )
+        manifest_text = canonical_json(manifest)
+        manifest_digest = _sha256_text(manifest_text)
+        target = exports.manifest_path(task["output_dir"], task_id)
+        exports.atomic_write(target, manifest_text.encode("utf-8"))
+        now = self._now()
+        with transaction(self.connection, immediate=True):
+            self.connection.execute(
+                "INSERT INTO export_manifests(task_id,manifest_sha256,body_json,created_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET "
+                "manifest_sha256=excluded.manifest_sha256,body_json=excluded.body_json,created_at=excluded.created_at",
+                (task_id, manifest_digest, manifest_text, now),
+            )
+            self.connection.execute(
+                "UPDATE export_tasks SET state='succeeded',lease_owner=NULL,lease_expires_at=NULL,"
+                "last_error=NULL,updated_at=?,finished_at=? WHERE task_id=?",
+                (now, now, task_id),
+            )
+            self._audit("export_task", task_id, "export.completed", worker_id, {
+                "shard_count": len(shard_summaries),
+                "record_count": total_records,
+                "manifest_sha256": manifest_digest,
+            })
+        return {
+            "task_id": task_id,
+            "state": "succeeded",
+            "processed": 0,
+            "shards_pending": 0,
+            "manifest_sha256": manifest_digest,
+            "record_count": total_records,
+        }
+
+    def fail_export(self, worker_id: str, task_id: str, error: str, retry_seconds: int = 0) -> dict[str, Any]:
+        self._lease_export(task_id, worker_id)
+        available = isoformat(self.clock.now() + timedelta(seconds=retry_seconds))
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "UPDATE export_tasks SET state='queued',available_at=?,lease_owner=NULL,lease_expires_at=NULL,"
+                "last_error=?,updated_at=? WHERE task_id=? AND state='leased' AND lease_owner=?",
+                (available, error[:1000], self._now(), task_id, worker_id),
+            )
+            if cursor.rowcount != 1:
+                raise InvalidState("导出任务未由当前工作进程持有")
+        return {"task_id": task_id, "state": "queued", "available_at": available}
+
+    def get_export(self, actor_id: str, task_id: str) -> dict[str, Any]:
+        self._require(actor_id, "export.read")
+        return self._export_status(task_id)
+
+    def _export_status(self, task_id: str) -> dict[str, Any]:
+        task = self.connection.execute(
+            "SELECT * FROM export_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise NotFound("导出任务不存在")
+        shards = self.connection.execute(
+            "SELECT shard_index,ordinal_start,ordinal_end,state,record_count,record_types_json,"
+            "first_record_key,last_record_key,content_sha256 FROM export_shards "
+            "WHERE task_id=? ORDER BY shard_index",
+            (task_id,),
+        ).fetchall()
+        manifest = self.connection.execute(
+            "SELECT manifest_sha256,created_at FROM export_manifests WHERE task_id=?", (task_id,)
+        ).fetchone()
+        return {
+            "task_id": task["task_id"],
+            "state": task["state"],
+            "attempts": task["attempts"],
+            "output_dir": task["output_dir"],
+            "shard_count": task["shard_count"],
+            "records_per_shard": task["records_per_shard"],
+            "shards_confirmed": sum(1 for row in shards if row["state"] == "confirmed"),
+            "shards_pending": sum(1 for row in shards if row["state"] == "planned"),
+            "lease_owner": task["lease_owner"],
+            "lease_expires_at": task["lease_expires_at"],
+            "last_error": task["last_error"],
+            "created_at": task["created_at"],
+            "finished_at": task["finished_at"],
+            "manifest": None if manifest is None else {
+                "manifest_sha256": manifest["manifest_sha256"],
+                "created_at": manifest["created_at"],
+            },
+            "shards": [
+                {
+                    "index": row["shard_index"],
+                    "ordinal_start": row["ordinal_start"],
+                    "ordinal_end": row["ordinal_end"],
+                    "state": row["state"],
+                    "record_count": row["record_count"],
+                    "record_types": json.loads(row["record_types_json"]),
+                    "first_record_key": row["first_record_key"],
+                    "last_record_key": row["last_record_key"],
+                    "content_sha256": row["content_sha256"],
+                }
+                for row in shards
+            ],
+        }
+
+    def verify_export(self, task_id: str) -> dict[str, Any]:
+        """独立复核已完成导出：重读磁盘清单与全部分片并逐项比对。"""
+
+        task = self.connection.execute(
+            "SELECT * FROM export_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise NotFound("导出任务不存在")
+        if task["state"] != "succeeded":
+            raise InvalidState("只有已完成的导出任务可以复核")
+        manifest_row = self.connection.execute(
+            "SELECT * FROM export_manifests WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if manifest_row is None:
+            raise ExportIntegrityError("数据库中缺少导出清单")
+        manifest_file = exports.manifest_path(task["output_dir"], task_id)
+        try:
+            manifest_bytes = manifest_file.read_bytes()
+        except OSError as exc:
+            raise ExportIntegrityError(f"无法读取清单 {manifest_file.name}: {exc}") from exc
+        if _sha256_text(manifest_bytes.decode("utf-8")) != manifest_row["manifest_sha256"]:
+            raise ExportIntegrityError("清单文件摘要与数据库记录不一致")
+        try:
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ExportIntegrityError("清单不是有效 JSON") from exc
+        if manifest_bytes.decode("utf-8") != canonical_json(manifest):
+            raise ExportIntegrityError("清单序列化形式不是规范化文本")
+        shard_rows = self.connection.execute(
+            "SELECT * FROM export_shards WHERE task_id=? ORDER BY shard_index", (task_id,)
+        ).fetchall()
+        if len(manifest["shards"]) != len(shard_rows):
+            raise ExportIntegrityError("清单分片数量与数据库不一致")
+        for entry, shard in zip(manifest["shards"], shard_rows):
+            path = Path(task["output_dir"]) / task_id / entry["file"]
+            summary = exports.inspect_shard_file(path, shard["ordinal_start"], shard["ordinal_end"])
+            if summary["content_sha256"] != entry["content_sha256"]:
+                raise ExportIntegrityError(f"分片 {entry['file']} 内容摘要与清单不一致")
+            if summary["content_sha256"] != shard["content_sha256"]:
+                raise ExportIntegrityError(f"分片 {entry['file']} 内容摘要与确认记录不一致")
+            if summary["record_count"] != entry["record_count"]:
+                raise ExportIntegrityError(f"分片 {entry['file']} 记录数与清单不一致")
+            if summary["record_types"] != entry["record_types"]:
+                raise ExportIntegrityError(f"分片 {entry['file']} 记录类型分布与清单不一致")
+        recomputed = _sha256_text(canonical_json([
+            {
+                "index": item["index"],
+                "file": item["file"],
+                "ordinal_start": item["ordinal_start"],
+                "ordinal_end": item["ordinal_end"],
+                "content_sha256": item["content_sha256"],
+            }
+            for item in manifest["shards"]
+        ]))
+        if recomputed != manifest["overall_sha256"]:
+            raise ExportIntegrityError("整体摘要复核失败")
+        frozen = self._frozen_batches(task_id)
+        if len(manifest["batches"]) != len(frozen):
+            raise ExportIntegrityError("清单冻结批次数量与数据库不一致")
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "shard_count": len(shard_rows),
+            "record_count": manifest["record_count_total"],
+            "manifest_sha256": manifest_row["manifest_sha256"],
+            "overall_sha256": manifest["overall_sha256"],
         }

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -157,12 +157,76 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS export_tasks (
+    task_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    request_json TEXT NOT NULL,
+    output_dir TEXT NOT NULL,
+    shard_count INTEGER NOT NULL CHECK (shard_count > 0),
+    records_per_shard INTEGER NOT NULL CHECK (records_per_shard > 0),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    last_error TEXT,
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE (request_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS export_batches (
+    task_id TEXT NOT NULL REFERENCES export_tasks(task_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    batch_id TEXT NOT NULL,
+    batch_revision INTEGER NOT NULL,
+    protocol_id TEXT NOT NULL,
+    protocol_version INTEGER NOT NULL,
+    protocol_sha256 TEXT NOT NULL,
+    analysis_id INTEGER,
+    analysis_sha256 TEXT,
+    decision_id INTEGER,
+    decision_sha256 TEXT,
+    observation_high_id INTEGER NOT NULL,
+    event_high_id INTEGER NOT NULL,
+    observation_count INTEGER NOT NULL DEFAULT 0 CHECK (observation_count >= 0),
+    event_count INTEGER NOT NULL DEFAULT 0 CHECK (event_count >= 0),
+    frozen_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, ordinal),
+    UNIQUE (task_id, batch_id)
+);
+
+CREATE TABLE IF NOT EXISTS export_shards (
+    task_id TEXT NOT NULL REFERENCES export_tasks(task_id),
+    shard_index INTEGER NOT NULL CHECK (shard_index >= 0),
+    ordinal_start INTEGER NOT NULL,
+    ordinal_end INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('planned', 'confirmed')),
+    record_count INTEGER,
+    record_types_json TEXT NOT NULL,
+    first_record_key TEXT,
+    last_record_key TEXT,
+    content_sha256 TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, shard_index)
+);
+
+CREATE TABLE IF NOT EXISTS export_manifests (
+    task_id TEXT PRIMARY KEY REFERENCES export_tasks(task_id),
+    manifest_sha256 TEXT NOT NULL CHECK (length(manifest_sha256) = 64),
+    body_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
+    "export_tasks", "export_batches", "export_shards", "export_manifests",
 })
 
 

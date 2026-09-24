@@ -47,10 +47,21 @@ def run(workspace: Path) -> dict[str, object]:
                 "approver-1", "batch-demo", analysis["analysis_id"], decision_value, "离线验收决定"
             )
             report = service.report("auditor-1", "batch-demo")
+            export_dir = Path(temporary) / "exports"
+            export_task = service.create_export(
+                "auditor-1", ["batch-demo"], export_dir, records_per_shard=5
+            )
+            export_lease = service.claim_export("worker-1", lease_seconds=60)
+            if export_lease is None or export_lease["task_id"] != export_task["task_id"]:
+                raise RuntimeError("未能领取导出任务")
+            export_result = service.advance_export("worker-1", export_task["task_id"])
+            if export_result["state"] != "succeeded":
+                raise RuntimeError("证据包导出未完成")
+            export_verification = service.verify_export(export_task["task_id"])
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
     return {
         "status": "ok",
@@ -61,6 +72,10 @@ def run(workspace: Path) -> dict[str, object]:
         "conclusion": analysis["result"]["conclusion"],
         "decision": report["decision"]["decision"],
         "event_count": len(report["events"]),
+        "export_task_id": export_task["task_id"],
+        "export_shards": export_verification["shard_count"],
+        "export_records": export_verification["record_count"],
+        "export_manifest_sha256": export_verification["manifest_sha256"],
         "schema": schema,
     }
 
