@@ -6,6 +6,7 @@
 
 - `api.py`：标准库实现的 HTTP JSON 接口与无网络路由测试边界；
 - `service.py`：角色权限、批次状态机、幂等导入、排除复核、任务租约、审批和报告；
+- `export.py`：监管证据包导出任务、提交时冻结、分片 JSONL 与清单生成、摘要复核和独立命令入口；
 - `analysis.py`：分层覆盖、Wilson 区间、描述性统计、确定性 bootstrap 和准入规则；
 - `contracts.py`：协议、指标、分层、权重、随机种子和单次观测的数据契约；
 - `jsonio.py`：严格 JSON/JSONL 读取、规范化序列化与内容摘要；
@@ -15,6 +16,8 @@
 - `acceptance.py`：贯通建档、导入、封存、分析、审批和报告的离线验收。
 
 系统已经实现以下主流程：协议发布后不可原地覆盖；批次按版本从草稿进入运行、封存、分析和决定状态；观测分片同时受请求幂等键和来源行唯一身份保护；排除请求必须由不同角色复核；分析任务使用 SQLite 租约避免重复执行并支持过期接管；同一输入快照使用固定算法版本和随机种子得到一致结果；分析者与审批人职责分离，报告保留输入摘要、统计规则和批次审计链。
+
+监管报送场景下，审计人员可以一次提交数百个批次的导出请求。系统在提交时立即冻结每个批次引用的协议摘要、分析版本、决定和审计事件上界，后台工作进程按确定顺序把冻结记录写成分片 JSONL，并生成记录每个分片内容摘要、记录范围和整体摘要的清单。导出任务复用分析任务的租约模型，支持失败重试、到期接管和从最后已确认分片继续；同一导出请求重复提交返回同一任务而不产生重复产物。批次在冻结后产生的新事件不影响本次导出，任务元数据会标明事件截点和冻结后新增事件数。只有全部分片摘要复核成功后任务才完成，任何分片被篡改或缺失都会阻止完成并在校验结果中列出。
 
 ## 环境
 
@@ -55,6 +58,30 @@ PYTHONPATH=src python3 -m robot_trials.acceptance --workspace .
 ```
 
 成功时退出码为 `0`，输出中的 `status` 为 `ok`。验收过程不会写入仓库，也不需要浏览器或外部服务。
+
+## 证据包导出命令
+
+无需启动 HTTP 服务，可直接用独立命令创建、推进并校验监管证据包导出：
+
+```bash
+# 创建导出任务（同一批次集合与分片大小重复提交返回同一任务）
+PYTHONPATH=src python3 -m robot_trials.export --database robot_trials.sqlite3 submit \
+    --actor auditor-1 --batch batch-a --batch batch-b --shard-size 100
+
+# 工作进程领取并推进任务，直到全部完成（支持崩溃后由其他进程接管续跑）
+PYTHONPATH=src python3 -m robot_trials.export --database robot_trials.sqlite3 work \
+    --worker export-worker-1 --export-root exports
+
+# 查看任务状态、冻结截点和清单摘要
+PYTHONPATH=src python3 -m robot_trials.export --database robot_trials.sqlite3 status \
+    --actor auditor-1 --export-id 1
+
+# 独立复核分片文件与清单摘要；全部一致时退出码为 0
+PYTHONPATH=src python3 -m robot_trials.export --database robot_trials.sqlite3 verify \
+    --export-id 1 --export-root exports
+```
+
+导出产物按 `exports/export-<id>/shard-XXXXXX.jsonl` 与 `exports/export-<id>/manifest.json` 组织，清单遵循 `robot-trials-export/1` 格式，记录每个分片的内容摘要、记录范围和整体摘要。
 
 ## 启动 HTTP 服务
 

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -157,12 +157,59 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS export_jobs (
+    export_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_sha256 TEXT NOT NULL UNIQUE CHECK (length(request_sha256) = 64),
+    requested_by TEXT NOT NULL REFERENCES users(user_id),
+    state TEXT NOT NULL CHECK (state IN ('queued', 'leased', 'succeeded', 'failed')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    shard_size INTEGER NOT NULL CHECK (shard_size > 0),
+    shard_count INTEGER NOT NULL CHECK (shard_count > 0),
+    record_count INTEGER NOT NULL CHECK (record_count > 0),
+    manifest_sha256 TEXT CHECK (manifest_sha256 IS NULL OR length(manifest_sha256) = 64),
+    available_at TEXT NOT NULL,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS export_job_batches (
+    export_id INTEGER NOT NULL REFERENCES export_jobs(export_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+    batch_revision INTEGER NOT NULL,
+    protocol_sha256 TEXT NOT NULL CHECK (length(protocol_sha256) = 64),
+    analysis_id INTEGER REFERENCES analyses(analysis_id),
+    decision_id INTEGER REFERENCES decisions(decision_id),
+    event_upper_bound INTEGER NOT NULL CHECK (event_upper_bound >= 0),
+    batch_snapshot_json TEXT NOT NULL,
+    exclusions_json TEXT NOT NULL,
+    frozen_at TEXT NOT NULL,
+    PRIMARY KEY (export_id, ordinal),
+    UNIQUE (export_id, batch_id)
+);
+
+CREATE TABLE IF NOT EXISTS export_shards (
+    export_id INTEGER NOT NULL REFERENCES export_jobs(export_id),
+    shard_index INTEGER NOT NULL CHECK (shard_index >= 0),
+    record_from INTEGER NOT NULL CHECK (record_from >= 0),
+    record_to INTEGER NOT NULL CHECK (record_to > record_from),
+    record_count INTEGER NOT NULL CHECK (record_count > 0),
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    relative_path TEXT NOT NULL,
+    confirmed_at TEXT NOT NULL,
+    PRIMARY KEY (export_id, shard_index)
+);
 """
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "analyses", "decisions", "audit_events", "export_jobs", "export_job_batches",
+    "export_shards",
 })
 
 

@@ -23,7 +23,7 @@ ROLE_PERMISSIONS = {
     },
     "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
     "approver": {"decision.write"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "export.create", "export.read"},
 }
 
 

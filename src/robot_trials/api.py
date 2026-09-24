@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from .errors import ServiceError, ValidationFailed
+from .export import DEFAULT_SHARD_SIZE, ExportService
 from .service import TrialService
 from .storage import connect
 
@@ -25,8 +26,9 @@ class Response:
 class JsonApplication:
     """将 HTTP 路由映射到领域服务，便于无网络单元测试。"""
 
-    def __init__(self, service: TrialService) -> None:
+    def __init__(self, service: TrialService, export_service: ExportService | None = None) -> None:
         self.service = service
+        self.export_service = export_service or ExportService(service.connection, service.clock)
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -133,6 +135,38 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            if method == "POST" and path == "/exports":
+                result = self.export_service.submit_export(
+                    self._actor(normalized_headers),
+                    payload["batch_ids"],
+                    int(payload.get("shard_size", DEFAULT_SHARD_SIZE)),
+                )
+                return Response(201, result)
+            if method == "POST" and path == "/exports/claim":
+                result = self.export_service.claim_export(
+                    payload["worker_id"], int(payload.get("lease_seconds", 60))
+                )
+                return Response(200, {"export": result})
+            if method == "POST" and len(parts) == 3 and parts[0] == "exports" and parts[2] == "advance":
+                result = self.export_service.advance_export(
+                    payload["worker_id"], int(parts[1]), payload["export_root"],
+                    lease_seconds=(None if payload.get("lease_seconds") is None
+                                   else int(payload["lease_seconds"])),
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "exports" and parts[2] == "fail":
+                result = self.export_service.fail_export(
+                    payload["worker_id"], int(parts[1]), payload["error"],
+                    int(payload.get("retry_seconds", 0)),
+                )
+                return Response(200, result)
+            if method == "GET" and len(parts) == 2 and parts[0] == "exports":
+                result = self.export_service.get_export(self._actor(normalized_headers), int(parts[1]))
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "exports" and parts[2] == "verify":
+                return Response(
+                    200, self.export_service.verify_export(int(parts[1]), payload["export_root"])
+                )
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
